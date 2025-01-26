@@ -167,9 +167,16 @@ class LLMPerformanceTester:
             self.metrics.extend(results)
 
     def calculate_results(self, concurrent_level: int) -> TestResults:
-        level_metrics = [m for m in self.metrics if m.concurrent_level == concurrent_level]
+        # Get only the most recent batch of metrics for this concurrency level
+        # This ensures we don't mix metrics from multiple test runs
+        total_metrics = len([m for m in self.metrics if m.concurrent_level == concurrent_level])
+        level_metrics = self.metrics[-total_metrics:]  # Take the last batch
+        
         response_times = [m.response_time for m in level_metrics]
         successful = [m for m in level_metrics if m.status == 'success']
+        
+        if not response_times:
+            raise ValueError(f"No metrics found for concurrency level {concurrent_level}")
         
         return TestResults(
             concurrent_level=concurrent_level,
@@ -180,31 +187,47 @@ class LLMPerformanceTester:
             max_response_time=max(response_times),
             successful_requests=len(successful),
             failed_requests=len(level_metrics) - len(successful),
-            avg_tokens_per_second=statistics.mean([m.tokens_per_second for m in successful]),
+            avg_tokens_per_second=statistics.mean([m.tokens_per_second for m in successful]) if successful else 0,
             total_tokens=sum(m.token_count for m in successful)
         )
 
-    def display_results(self, results: List[TestResults]) -> None:
-        table = Table(title="LLM Performance Test Results")
+    def display_results(self, results: List[TestResults], total_time: float, total_requests: int, 
+                       avg_response_time: float, successful_requests: int, failed_requests: int) -> None:
+        # First table - Test Results
+        results_table = Table(title="LLM Performance Test Results")
         
-        table.add_column("Concurrent\nRequests", justify="right")
-        table.add_column("Avg Response\nTime (s)", justify="right")
-        table.add_column("Median Response\nTime (s)", justify="right")
-        table.add_column("P95 Response\nTime (s)", justify="right")
-        table.add_column("Success/Total", justify="right")
-        table.add_column("Avg Tokens/sec", justify="right")
+        results_table.add_column("Concurrent\nRequests", justify="right")
+        results_table.add_column("Test Time (s)", justify="right")
+        results_table.add_column("Avg Time\nper Request (s)", justify="right")
+        results_table.add_column("Success/Total", justify="right")
         
         for result in results:
-            table.add_row(
+            total_reqs = result.successful_requests + result.failed_requests
+            avg_time_per_req = result.avg_response_time / result.concurrent_level
+            test_time = result.max_response_time
+            
+            results_table.add_row(
                 str(result.concurrent_level),
-                f"{result.avg_response_time:.2f}",
-                f"{result.median_response_time:.2f}",
-                f"{result.p95_response_time:.2f}",
-                f"{result.successful_requests}/{result.successful_requests + result.failed_requests}",
-                f"{result.avg_tokens_per_second:.1f}"
+                f"{test_time:.2f}",
+                f"{avg_time_per_req:.2f}",
+                f"{result.successful_requests}/{total_reqs}"
             )
         
-        self.console.print(table)
+        # Second table - Overall Statistics
+        stats_table = Table(title="\nOverall Statistics")
+        
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Value", justify="right")
+        
+        stats_table.add_row("Total wall time", f"{total_time:.2f} seconds")
+        stats_table.add_row("Total requests", str(total_requests))
+        stats_table.add_row("Successful/Failed", f"{successful_requests}/{failed_requests}")
+        stats_table.add_row("Average time per request", f"{total_time/total_requests:.2f} seconds")
+        stats_table.add_row("Throughput", f"{total_requests/total_time:.2f} requests/second")
+        
+        # Print both tables
+        self.console.print(results_table)
+        self.console.print(stats_table)
 
 async def main():
     parser = argparse.ArgumentParser(description='LLM Performance Testing Tool')
@@ -217,8 +240,14 @@ async def main():
                        help='Model to use (for OpenAI provider)')
     parser.add_argument('--prompts-file', default='test_prompts.txt',
                        help='File containing test prompts')
-    parser.add_argument('--max-concurrent', type=int, default=10,
-                       help='Maximum concurrent connections to test')
+    
+    # Add mutually exclusive group for test mode
+    test_mode = parser.add_mutually_exclusive_group()
+    test_mode.add_argument('--single-shot', type=int, metavar='N',
+                          help='Run a single test with N concurrent connections')
+    test_mode.add_argument('--max-concurrent', type=int, default=10,
+                          help='Maximum concurrent connections to test')
+    
     parser.add_argument('--concurrent-step', type=int, default=1,
                        help='Step size between concurrent connection tests')
     parser.add_argument('--requests-per-level', type=int, default=1,
@@ -241,40 +270,75 @@ async def main():
     
     tester = LLMPerformanceTester(config, args.prompts_file)
     
-    concurrency_levels = range(args.concurrent_step, args.max_concurrent + 1, args.concurrent_step)
-    all_results = []
-    
-    print(f"\nTesting concurrent connections from {args.concurrent_step} to {args.max_concurrent} in steps of {args.concurrent_step}")
-    
-    for level in concurrency_levels:
-        print(f"\nTesting with {level} concurrent connections...")
-        # Run the test multiple times if requested
-        for _ in range(args.requests_per_level):
-            await tester.run_concurrent_test(level, args.requests_per_level)
-            total_requests += level  # Add the number of concurrent requests we just made
+    # Handle single shot test
+    if args.single_shot is not None:
+        print(f"\nRunning single test with {args.single_shot} concurrent connections...")
+        await tester.run_concurrent_test(args.single_shot, args.requests_per_level)
+        total_requests += args.single_shot
+        results = tester.calculate_results(args.single_shot)
+        all_results = [results]
+    else:
+        # Regular incremental testing
+        concurrency_levels = range(args.concurrent_step, args.max_concurrent + 1, args.concurrent_step)
+        all_results = []
         
-        results = tester.calculate_results(level)
-        all_results.append(results)
+        print(f"\nTesting concurrent connections from {args.concurrent_step} to {args.max_concurrent} in steps of {args.concurrent_step}")
         
+        for level in concurrency_levels:
+            print(f"\nTesting with {level} concurrent connections...")
+            for _ in range(args.requests_per_level):
+                await tester.run_concurrent_test(level, args.requests_per_level)
+                total_requests += level
+            
+            results = tester.calculate_results(level)
+            all_results.append(results)
+    
     total_time = time.time() - total_start_time
     
-    tester.display_results(all_results)
+    # Calculate overall statistics
+    all_response_times = [metric.response_time for metric in tester.metrics]
+    avg_response_time = statistics.mean(all_response_times)
+    successful_requests = len([m for m in tester.metrics if m.status == 'success'])
+    failed_requests = len(tester.metrics) - successful_requests
     
-    # Display overall statistics
-    print("\nOverall Statistics:")
-    print(f"Total time: {total_time:.2f} seconds")
-    print(f"Total requests: {total_requests}")
-    print(f"Average time per request: {total_time/total_requests:.2f} seconds")
+    # Display results with both tables
+    tester.display_results(
+        all_results,
+        total_time,
+        total_requests,
+        avg_response_time,
+        successful_requests,
+        failed_requests
+    )
     
     # Save results to file
     with open('llm_performance_results.json', 'w') as f:
+        # Calculate per-test metrics for JSON output
+        test_details = []
+        for result in all_results:
+            total_reqs = result.successful_requests + result.failed_requests
+            avg_time_per_req = result.avg_response_time / result.concurrent_level
+            test_details.append({
+                "concurrent_requests": result.concurrent_level,
+                "test_time": result.max_response_time,
+                "avg_time_per_request": avg_time_per_req,
+                "successful_requests": result.successful_requests,
+                "total_requests": total_reqs,
+                "success_rate": f"{result.successful_requests}/{total_reqs}"
+            })
+
         json.dump({
-            "test_results": [asdict(r) for r in all_results],
+            "test_details": test_details,
             "overall_stats": {
-                "total_time": total_time,
+                "total_wall_time": total_time,
                 "total_requests": total_requests,
-                "avg_time_per_request": total_time/total_requests
-            }
+                "successful_requests": successful_requests,
+                "failed_requests": failed_requests,
+                "success_rate": f"{successful_requests}/{total_requests}",
+                "avg_time_per_request": total_time/total_requests,
+                "throughput": total_requests/total_time
+            },
+            "raw_test_results": [asdict(r) for r in all_results]  # Keep the original detailed data
         }, f, indent=2)
 
 if __name__ == "__main__":

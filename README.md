@@ -100,6 +100,21 @@ This will:
 3. Show overall statistics
 4. Save detailed results to llm_performance_results.json
 
+### Single Shot Testing
+
+To quickly test a specific number of concurrent connections:
+```bash
+python llm_performance_test.py --single-shot 50
+```
+
+This will:
+1. Run a single test with exactly 50 concurrent connections
+2. Display results in a table
+3. Show overall statistics
+4. Save results to llm_performance_results.json
+
+This is useful for quick performance checks at a specific concurrency level without running through all intermediate steps.
+
 ## Prompt File Format
 
 Create a text file (default: test_prompts.txt) with one prompt per line. The tool will randomly select prompts from this file for testing. Example:
